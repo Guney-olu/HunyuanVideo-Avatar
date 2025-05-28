@@ -1,22 +1,18 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Union, Dict, Any
+from typing import Optional, Tuple
 from copy import deepcopy
 
 import torch, os
 import torch.nn as nn
 from transformers import (
     CLIPTextModel, CLIPTokenizer, LlavaForConditionalGeneration,
-    LlamaTokenizerFast, AutoProcessor # Added AutoProcessor
+    LlamaTokenizerFast
 )
 from transformers.utils import ModelOutput
 from ..constants import TEXT_ENCODER_PATH, TOKENIZER_PATH, PRECISION_TO_TYPE
 
 CPU_OFFLOAD = int(os.environ.get("CPU_OFFLOAD", 0))
-# Using a global logger instance is generally not ideal in libraries,
-# but following the existing pattern.
-from loguru import logger as global_logger # Assuming loguru is used globally
 print(f'text_encoder: cpu_offload={CPU_OFFLOAD}')
-
 
 def use_default(value, default):
     return value if value is not None else default
@@ -24,78 +20,74 @@ def use_default(value, default):
 def load_text_encoder(text_encoder_type,
                       text_encoder_precision=None,
                       text_encoder_path=None,
-                      logger=None, # Parameter for local logger
+                      logger=None,
                       device=None
                       ):
-    effective_logger = logger if logger is not None else global_logger
     if text_encoder_path is None:
         text_encoder_path = TEXT_ENCODER_PATH[text_encoder_type]
-    effective_logger.info(f"Loading text encoder model ({text_encoder_type}) from: {text_encoder_path}")
-
-    target_dtype = PRECISION_TO_TYPE.get(text_encoder_precision, torch.float16) # Default to float16 if None
+    if logger is not None:
+        logger.info(f"Loading text encoder model ({text_encoder_type}) from: {text_encoder_path}")
 
     if text_encoder_type == "clipL":
-        text_encoder = CLIPTextModel.from_pretrained(text_encoder_path, torch_dtype=target_dtype)
-        # text_encoder.final_layer_norm = text_encoder.text_model.final_layer_norm # Already part of CLIPTextModel
+        text_encoder = CLIPTextModel.from_pretrained(text_encoder_path)
+        text_encoder.final_layer_norm = text_encoder.text_model.final_layer_norm
     elif text_encoder_type == "llava-llama-3-8b":
-        text_encoder = LlavaForConditionalGeneration.from_pretrained(
-            text_encoder_path,
-            low_cpu_mem_usage=True, # Good for large models
-            torch_dtype=target_dtype
-        )
-        # Accessing final_layer_norm, ensure path is correct for your LLaVA model version
-        if hasattr(text_encoder, 'language_model') and hasattr(text_encoder.language_model, 'model') and hasattr(text_encoder.language_model.model, 'norm'):
-            text_encoder.final_layer_norm = text_encoder.language_model.model.norm
-        else:
-            effective_logger.warning(f"Could not set final_layer_norm for LLaVA model {text_encoder_type}. Check model structure.")
-            text_encoder.final_layer_norm = None # Or some default nn.Identity()
+        text_encoder = LlavaForConditionalGeneration.from_pretrained(text_encoder_path, low_cpu_mem_usage=True)
+        text_encoder.final_layer_norm = text_encoder.language_model.model.norm
     else:
         raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
 
-    text_encoder.requires_grad_(False)
-    text_encoder.eval() # Set to eval mode
+    if text_encoder_precision is not None:
+        text_encoder = text_encoder.to(dtype=PRECISION_TO_TYPE[text_encoder_precision])
 
-    effective_logger.info(f"Text encoder loaded with dtype: {text_encoder.dtype}")
+    text_encoder.requires_grad_(False)
+
+    if logger is not None:
+        logger.info(f"Text encoder to dtype: {text_encoder.dtype}")
 
     if device is not None:
         text_encoder = text_encoder.to(device)
-        effective_logger.info(f"Text encoder moved to device: {text_encoder.device}")
-
 
     return text_encoder, text_encoder_path
 
-def load_processor_or_tokenizer( # Renamed to reflect it can load a processor
-                   processor_tokenizer_type, # Renamed
-                   processor_tokenizer_path=None, # Renamed
+def load_tokenizer(tokenizer_type,
+                   tokenizer_path=None,
                    padding_side="right",
-                   logger=None # Parameter for local logger
+                   logger=None
                    ):
-    effective_logger = logger if logger is not None else global_logger
-    if processor_tokenizer_path is None:
-        # Assuming TOKENIZER_PATH for LLaVA points to the same model hub ID or local path
-        processor_tokenizer_path = TOKENIZER_PATH[processor_tokenizer_type]
+    if tokenizer_path is None:
+        tokenizer_path = TOKENIZER_PATH[tokenizer_type]
+    if logger is not None:
+        logger.info(f"Loading tokenizer ({tokenizer_type}) from: {tokenizer_path}")
 
-    effective_logger.info(f"Loading processor/tokenizer ({processor_tokenizer_type}) from: {processor_tokenizer_path}")
-
-    if processor_tokenizer_type == "clipL":
-        obj = CLIPTokenizer.from_pretrained(processor_tokenizer_path, max_length=77)
-    elif processor_tokenizer_type == "llava-llama-3-8b":
-        try:
-            # AutoProcessor will load the correct LlavaProcessor or LlavaNextProcessor
-            obj = AutoProcessor.from_pretrained(processor_tokenizer_path, padding_side=padding_side)
-            effective_logger.info(f"Loaded LLaVA processor of type: {type(obj)}")
-        except Exception as e:
-            effective_logger.error(f"Failed to load AutoProcessor for LLaVA from {processor_tokenizer_path}: {e}. "
-                               f"Ensure the path contains processor_config.json.")
-            raise
+    if tokenizer_type == "clipL":
+        tokenizer = CLIPTokenizer.from_pretrained(tokenizer_path, max_length=77)
+    elif tokenizer_type == "llava-llama-3-8b":
+        tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_path, padding_side=padding_side)
     else:
-        raise ValueError(f"Unsupported processor/tokenizer type: {processor_tokenizer_type}")
+        raise ValueError(f"Unsupported tokenizer type: {tokenizer_type}")
 
-    return obj, processor_tokenizer_path
+    return tokenizer, tokenizer_path
 
 
 @dataclass
 class TextEncoderModelOutput(ModelOutput):
+    """
+    Base class for model's outputs that also contains a pooling of the last hidden states.
+
+    Args:
+        hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        attention_mask (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
+        hidden_states_list (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        text_outputs (`list`, *optional*, returned when `return_texts=True` is passed):
+            List of decoded texts.
+    """
+
     hidden_state: torch.FloatTensor = None
     attention_mask: Optional[torch.LongTensor] = None
     hidden_states_list: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -108,8 +100,8 @@ class TextEncoder(nn.Module):
                  max_length: int,
                  text_encoder_precision: Optional[str] = None,
                  text_encoder_path: Optional[str] = None,
-                 tokenizer_type: Optional[str] = None, # Will be processor type for LLaVA
-                 tokenizer_path: Optional[str] = None, # Will be processor path for LLaVA
+                 tokenizer_type: Optional[str] = None,
+                 tokenizer_path: Optional[str] = None,
                  output_key: Optional[str] = None,
                  use_attention_mask: bool = True,
                  input_max_length: Optional[int] = None,
@@ -117,257 +109,186 @@ class TextEncoder(nn.Module):
                  hidden_state_skip_layer: Optional[int] = None,
                  apply_final_norm: bool = False,
                  reproduce: bool = False,
-                 logger=None, # Instance logger
-                 device=None, # Target device
+                 logger=None,
+                 device=None,
                  ):
         super().__init__()
         self.text_encoder_type = text_encoder_type
         self.max_length = max_length
-        self.precision = text_encoder_precision # Stored but dtype primarily set during model load
+        self.precision = text_encoder_precision
         self.model_path = text_encoder_path
-        
-        self.processor_tokenizer_type = tokenizer_type if tokenizer_type is not None else text_encoder_type
-        self.processor_tokenizer_path_arg = tokenizer_path # Store user-provided path
-        
+        self.tokenizer_type = tokenizer_type if tokenizer_type is not None else text_encoder_type
+        self.tokenizer_path = tokenizer_path if tokenizer_path is not None else text_encoder_path
         self.use_attention_mask = use_attention_mask
-        if prompt_template_video is not None:
+        if prompt_template_video is not None: 
             assert use_attention_mask is True, "Attention mask is True required when training videos."
         self.input_max_length = input_max_length if input_max_length is not None else max_length
         self.prompt_template_video = prompt_template_video
         self.hidden_state_skip_layer = hidden_state_skip_layer
         self.apply_final_norm = apply_final_norm
         self.reproduce = reproduce
-        self.logger = logger if logger is not None else global_logger
-        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.logger = logger
 
         self.use_video_template = self.prompt_template_video is not None
-        # ... (template validation logic - seems fine) ...
+        if self.use_video_template:
+            if self.prompt_template_video is not None:
+                assert isinstance(self.prompt_template_video, dict) and "template" in self.prompt_template_video, (
+                    f"`prompt_template_video` must be a dictionary with a key 'template', got {self.prompt_template_video}"
+                )
+            assert '{}' in str(self.prompt_template_video["template"]), (
+                "`prompt_template_video['template']` must contain a placeholder `{}` for the input text, "
+                f"got {self.prompt_template_video['template']}"
+            )
 
         if "clip" in text_encoder_type:
-            self.output_key = output_key or "pooler_output" # CLIP uses pooler_output or last_hidden_state
-        elif "llava" in text_encoder_type or "llama" in text_encoder_type: # Adjusted for LLaVA
-            self.output_key = output_key or "last_hidden_state" # LLaMA part of LLaVA uses last_hidden_state
+            self.output_key = output_key or "pooler_output"
+        elif "llama" in text_encoder_type:
+            self.output_key = output_key or "last_hidden_state"
         else:
             raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
 
-        self.model, self.model_path_loaded = load_text_encoder(
+        self.model, self.model_path = load_text_encoder(
             text_encoder_type=self.text_encoder_type,
             text_encoder_precision=self.precision,
             text_encoder_path=self.model_path,
             logger=self.logger,
-            device=self.device # Pass target device
+            device=device
         )
-        self.dtype = self.model.dtype # Get actual dtype from loaded model
+        self.dtype = self.model.dtype
+        self.device = self.model.device
 
-        # For LLaVA, this loads the LlavaProcessor. For CLIP, CLIPTokenizer.
-        _processor_tokenizer_path = self.processor_tokenizer_path_arg
-        if _processor_tokenizer_path is None: # If user didn't specify, use same as model path for LLaVA
-             _processor_tokenizer_path = self.model_path_loaded if "llava" in self.processor_tokenizer_type else self.processor_tokenizer_path_arg
-
-        self.processor_or_tokenizer, self.processor_or_tokenizer_path_loaded = load_processor_or_tokenizer(
-            processor_tokenizer_type=self.processor_tokenizer_type,
-            processor_tokenizer_path=_processor_tokenizer_path,
-            padding_side="right", # LLaMA typically uses right padding for tokenizer
+        self.tokenizer, self.tokenizer_path = load_tokenizer(
+            tokenizer_type=self.tokenizer_type,
+            tokenizer_path=self.tokenizer_path,
+            padding_side="right",
             logger=self.logger
         )
-        # Ensure processor's device matches model's device if it has components to move (though processors are usually CPU)
 
     def __repr__(self):
-        return f"{self.text_encoder_type} ({self.precision} - {self.model_path_loaded})"
+        return f"{self.text_encoder_type} ({self.precision} - {self.model_path})"
 
     @staticmethod
     def apply_text_to_template(text, template):
-        # ... (seems fine) ...
+        """
+        Apply text to template.
+
+        Args:
+            text (str): Input text.
+            template (str or list): Template string or list of chat conversation.
+            prevent_empty_text (bool): If Ture, we will prevent the user text from being empty
+                by adding a space. Defaults to True.
+        """
         if isinstance(template, str):
+            # Will send string to tokenizer. Used for llm
             return template.format(text)
         else:
             raise TypeError(f"Unsupported template type: {type(template)}")
+        
+    def text2tokens(self, text, data_type='video', name='person'):
+        """
+        Tokenize the input text.
 
-    def _prepare_text_with_template_and_llava_suffix(self, text, data_type='video', name='person'):
-        # Apply video template if configured
+        Args:
+            text (str or list): Input text.
+        """
+        tokenize_input_type = 'str'
         if self.use_video_template:
-            if data_type == 'video':
+            if data_type == 'video': 
                 prompt_template = self.prompt_template_video["template"]
-            else:
+            else: 
                 raise ValueError(f"Unsupported data type: {data_type}")
-            
             if isinstance(text, (list, tuple)):
-                processed_text = [self.apply_text_to_template(one_text, prompt_template) for one_text in text]
+                text = [self.apply_text_to_template(one_text, prompt_template) for one_text in text]
+                if isinstance(text[0], list):
+                    tokenize_input_type = 'list'
             elif isinstance(text, str):
-                processed_text = self.apply_text_to_template(text, prompt_template)
+                text = self.apply_text_to_template(text, prompt_template)
+                if isinstance(text, list):
+                    tokenize_input_type = 'list'
             else:
                 raise TypeError(f"Unsupported text type: {type(text)}")
-        else:
-            processed_text = text
 
-        # Apply LLaVA specific suffix if this is a LLaVA encoder
+        kwargs = dict(truncation=True, max_length=self.max_length, padding="max_length", return_tensors="pt")
         if self.text_encoder_type == "llava-llama-3-8b":
-            llava_suffix = f'\nThe {name} looks like<image>' # Or just "<image>" if that's what your model expects
-            # Standard LLaVA often uses "<image>\n{prompt}" or similar, where processor handles <image>
-            # Your suffix seems to be custom. The LLaVA processor needs to know about <image> as a special token.
-            if isinstance(processed_text, list):
-                # Ensure each item is a string before concatenation
-                final_text = [str(t) + llava_suffix for t in processed_text]
-            elif isinstance(processed_text, str):
-                final_text = str(processed_text) + llava_suffix
-            else: # Should not happen if use_video_template output is string or list of strings
-                raise TypeError(f"Processed text has unexpected type: {type(processed_text)}")
-        else:
-            final_text = processed_text
-        
-        return final_text
-
-    def get_processed_inputs(self, text: Union[str, List[str]], images: Optional[torch.Tensor] = None,
-                             data_type: str = 'video', name: str = 'person'):
-        """
-        Process raw text and optional images using the appropriate tokenizer or processor.
-        For LLaVA, this uses the LLaVA processor to handle both text and images.
-        For CLIP, this tokenizes text.
-        """
-        final_text = self._prepare_text_with_template_and_llava_suffix(text, data_type, name)
-
-        common_kwargs = dict(return_tensors="pt", padding="max_length", truncation=True, max_length=self.max_length)
-
-        if self.text_encoder_type == "llava-llama-3-8b":
-            # LLaVA processor handles text and images.
-            # `images` should be a BCHW tensor or list of PIL images.
-            # The processor will create 'input_ids', 'attention_mask', and 'pixel_values'.
-            if images is not None:
-                inputs = self.processor_or_tokenizer(text=final_text, images=images, **common_kwargs)
+            if isinstance(text, list):
+                for i in range(len(text)):
+                    text[i] = text[i] + '\nThe %s looks like<image>' % name
+            elif isinstance(text, str):
+                text = text + '\nThe %s looks like<image>' % name
             else:
-                # LLaVA processor can also process text-only prompts.
-                inputs = self.processor_or_tokenizer(text=final_text, **common_kwargs)
-        else: # For CLIP or other text-only encoders
-            inputs = self.processor_or_tokenizer(final_text, return_attention_mask=True, **common_kwargs)
-            # CLIP tokenizer doesn't inherently handle 'images' argument in this way.
-            if images is not None and self.logger:
-                self.logger.warning(f"Images provided to a non-LLaVA encoder ({self.text_encoder_type}), they will be ignored by tokenizer.")
-        
-        return inputs
+                raise NotImplementedError
 
-    def encode(self, text_or_processed_inputs: Union[str, List[str], Dict[str, torch.Tensor]],
-               images: Optional[torch.Tensor] = None, # For LLaVA, if text_or_processed_inputs is raw text
-               use_attention_mask: Optional[bool] = None,
-               output_hidden_states: Optional[bool] = False,
-               # do_sample: Optional[bool] = None, # Not typically used for getting embeddings
-               hidden_state_skip_layer: Optional[int] = None,
-               # return_texts: Optional[bool] = False, # Not typically used for getting embeddings
-               data_type: str = 'video', # For template and LLaVA suffix
-               name_for_template: str = 'person' # For LLaVA suffix
-              ):
-        
-        effective_use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
-        effective_hidden_state_skip_layer = use_default(hidden_state_skip_layer, self.hidden_state_skip_layer)
-        # effective_do_sample = use_default(do_sample, not self.reproduce) # Usually False for embeddings
-
-        if isinstance(text_or_processed_inputs, (str, list)):
-            # If raw text, process it with images if provided (for LLaVA)
-            processed_inputs = self.get_processed_inputs(text_or_processed_inputs, images=images,
-                                                         data_type=data_type, name=name_for_template)
-        elif isinstance(text_or_processed_inputs, dict):
-            processed_inputs = text_or_processed_inputs
-            # If inputs are pre-processed, ensure 'pixel_values' is present for LLaVA if an image was involved.
-            # And if raw 'images' are also passed now, it's ambiguous. Prioritize pre-processed.
-            if images is not None and "pixel_values" not in processed_inputs and self.text_encoder_type == "llava-llama-3-8b":
-                if self.logger: self.logger.warning("Received pre-tokenized inputs and raw images for LLaVA. Raw images might be ignored if not used to create 'pixel_values' in pre-tokenized input.")
+        if tokenize_input_type == 'str':
+            return self.tokenizer(text, return_length=False, return_overflowing_tokens=False, return_attention_mask=True, **kwargs, )
+        elif tokenize_input_type == 'list':
+            return self.tokenizer.apply_chat_template(text, add_generation_prompt=True, tokenize=True, return_dict=True, **kwargs, )
         else:
-            raise TypeError("Input must be str, list of str, or Dict of tensors.")
+            raise ValueError(f"Unsupported tokenize_input_type: {tokenize_input_type}")
 
+    def encode(self, batch_encoding, use_attention_mask=None, output_hidden_states=False, do_sample=None,
+               hidden_state_skip_layer=None, return_texts=False, data_type='image'):
+        """
+        Args:
+            batch_encoding (dict): Batch encoding from tokenizer.
+            use_attention_mask (bool): Whether to use attention mask. If None, use self.use_attention_mask.
+                Defaults to None.
+            output_hidden_states (bool): Whether to output hidden states. If False, return the value of
+                self.output_key. If True, return the entire output. If set self.hidden_state_skip_layer,
+                output_hidden_states will be set True. Defaults to False.
+            do_sample (bool): Whether to sample from the model. Used for Decoder-Only LLMs. Defaults to None.
+                When self.produce is False, do_sample is set to True by default.
+            hidden_state_skip_layer (int): Number of hidden states to hidden_state_skip_layer. 0 means the last layer.
+                If None, self.output_key will be used. Defaults to None.
+            return_texts (bool): Whether to return the decoded texts. Defaults to False.
+        """
+        use_attention_mask = use_default(use_attention_mask, self.use_attention_mask)
+        hidden_state_skip_layer = use_default(hidden_state_skip_layer, self.hidden_state_skip_layer)
+        do_sample = use_default(do_sample, not self.reproduce)
         if CPU_OFFLOAD:
-            self.model.to(self.device) # Move to target device (e.g. cuda)
-            if self.logger: self.logger.debug(f'encode prompt: move text_encoder to {self.device}')
+            self.model.to('cuda')
+            print(f'encode prompt: move text_encoder to cuda')
 
-        model_call_kwargs = {
-            "input_ids": processed_inputs["input_ids"].to(self.device),
-            "output_hidden_states": output_hidden_states or (effective_hidden_state_skip_layer is not None)
-        }
-
-        if effective_use_attention_mask and "attention_mask" in processed_inputs:
-            model_call_kwargs["attention_mask"] = processed_inputs["attention_mask"].to(self.device)
-        
-        # CRITICAL FOR LLAVA: Pass 'pixel_values' if the processor added them
-        if "pixel_values" in processed_inputs:
-            # Ensure dtype matches the model's expected input dtype for images
-            # LLaVA vision tower might expect float16/bfloat16 if model is in that precision
-            image_input_dtype = self.model.vision_tower.dtype if hasattr(self.model, 'vision_tower') else self.dtype
-            model_call_kwargs["pixel_values"] = processed_inputs["pixel_values"].to(dtype=image_input_dtype, device=self.device)
-
-        outputs = self.model(**model_call_kwargs)
-
-        # Extracting the correct hidden state
-        if effective_hidden_state_skip_layer is not None:
-            # This logic assumes 'outputs.hidden_states' exists and is a list/tuple
-            # For LLaVA, it might be outputs.language_model_outputs.hidden_states
-            if self.text_encoder_type == "llava-llama-3-8b" and hasattr(outputs, 'language_model_outputs'):
-                all_hidden_states = outputs.language_model_outputs.hidden_states
-            else:
-                all_hidden_states = outputs.hidden_states
-            
-            last_hidden_state = all_hidden_states[-(effective_hidden_state_skip_layer + 1)]
-            
-            if effective_hidden_state_skip_layer > 0 and self.apply_final_norm and self.model.final_layer_norm is not None:
+        attention_mask = batch_encoding["attention_mask"].to(self.model.device) if use_attention_mask else None
+        if 'pixel_value_llava' in batch_encoding:
+            outputs = self.model(
+                input_ids=batch_encoding["input_ids"].to(self.model.device),
+                attention_mask=attention_mask,
+                pixel_values=batch_encoding["pixel_value_llava"].to(self.model.device),
+                output_hidden_states=output_hidden_states or hidden_state_skip_layer is not None)
+        else:
+            outputs = self.model(
+            input_ids=batch_encoding["input_ids"].to(self.model.device),
+            attention_mask=attention_mask,
+            output_hidden_states=output_hidden_states or hidden_state_skip_layer is not None,)
+        if hidden_state_skip_layer is not None:
+            last_hidden_state = outputs.hidden_states[-(hidden_state_skip_layer + 1)]
+            # Real last hidden state already has layer norm applied. So here we only apply it
+            # for intermediate layers.
+            if hidden_state_skip_layer > 0 and self.apply_final_norm:
                 last_hidden_state = self.model.final_layer_norm(last_hidden_state)
         else:
-            if self.text_encoder_type == "llava-llama-3-8b":
-                # Standard LLaVA output has language_model_outputs
-                if hasattr(outputs, 'language_model_outputs') and outputs.language_model_outputs is not None:
-                    last_hidden_state = outputs.language_model_outputs.last_hidden_state
-                elif hasattr(outputs, 'last_hidden_state'): # Fallback if structure is flatter
-                     last_hidden_state = outputs.last_hidden_state
-                else: # Should not happen with standard LlavaForConditionalGeneration
-                    raise AttributeError("Could not extract last_hidden_state from LLaVA model output.")
-            elif "clip" in self.text_encoder_type:
-                if self.output_key == "pooler_output":
-                    last_hidden_state = outputs.pooler_output
-                else: # "last_hidden_state"
-                    last_hidden_state = outputs.last_hidden_state
-            else: # Fallback for other models if self.output_key is set
-                last_hidden_state = outputs[self.output_key]
-        
-        # Cropping logic (seems specific to video templates)
-        final_attention_mask_for_output = model_call_kwargs.get("attention_mask", None)
+            last_hidden_state = outputs[self.output_key]
+
+        # Remove hidden states of instruction tokens, only keep prompt tokens.
         if self.use_video_template:
-            if data_type == 'video':
+            if data_type == 'video': 
                 crop_start = self.prompt_template_video.get("crop_start", -1)
-            else:
-                # This path was problematic before, ensure it's handled or error out
-                raise ValueError(f"Video template cropping logic encountered unsupported data_type: {data_type}")
-            
+            else: 
+                raise ValueError(f"Unsupported data type: {data_type}")
             if crop_start > 0:
                 last_hidden_state = last_hidden_state[:, crop_start:]
-                if final_attention_mask_for_output is not None:
-                    final_attention_mask_for_output = final_attention_mask_for_output[:, crop_start:]
-        
+                attention_mask = attention_mask[:, crop_start:] if use_attention_mask else None
         if CPU_OFFLOAD:
             self.model.to('cpu')
             torch.cuda.empty_cache()
-            if self.logger: self.logger.debug(f'encode prompt successful: move text_encoder to cpu')
-        
-        # Determine hidden_states_list for output
-        hidden_states_list_for_output = None
-        if output_hidden_states or (effective_hidden_state_skip_layer is not None):
-            if self.text_encoder_type == "llava-llama-3-8b" and hasattr(outputs, 'language_model_outputs'):
-                hidden_states_list_for_output = outputs.language_model_outputs.hidden_states
-            else:
-                hidden_states_list_for_output = getattr(outputs, 'hidden_states', None)
+            print(f'encode prompt successful: move text_encoder to cpu')
+        if output_hidden_states:
+            return TextEncoderModelOutput(last_hidden_state, attention_mask, outputs.hidden_states)
+        return TextEncoderModelOutput(last_hidden_state, attention_mask)
 
-        return TextEncoderModelOutput(last_hidden_state, final_attention_mask_for_output, hidden_states_list_for_output)
-
-    def forward(self, text: Union[str, List[str]], 
-                images: Optional[torch.Tensor] = None, # For LLaVA
-                use_attention_mask: Optional[bool] = None, 
-                output_hidden_states: Optional[bool] = False, 
-                # do_sample: Optional[bool] = False, # Not used for embeddings
-                hidden_state_skip_layer: Optional[int] = None, 
-                # return_texts: Optional[bool] = False, # Not used for embeddings
-                data_type: str = 'video', 
-                name_for_template: str = 'person'):
-        
-        return self.encode(text_or_processed_inputs=text,
-                           images=images,
-                           use_attention_mask=use_attention_mask,
-                           output_hidden_states=output_hidden_states,
-                           hidden_state_skip_layer=hidden_state_skip_layer,
-                           data_type=data_type,
-                           name_for_template=name_for_template)
+    def forward(self, text, use_attention_mask=None, output_hidden_states=False, do_sample=False,
+                hidden_state_skip_layer=None, return_texts=False):
+        batch_encoding = self.text2tokens(text)
+        return self.encode(batch_encoding, use_attention_mask=use_attention_mask,
+                           output_hidden_states=output_hidden_states, do_sample=do_sample,
+                           hidden_state_skip_layer=hidden_state_skip_layer, return_texts=return_texts)
