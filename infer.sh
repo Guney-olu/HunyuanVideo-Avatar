@@ -12,7 +12,7 @@ checkpoint_path=${MODEL_BASE}/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_
 
 export DISABLE_SP=1
 CUDA_VISIBLE_DEVICES=0 python3 hymm_sp/sample_gpu_poor.py \
-    --input 'assets/test_2.csv' \
+    --input 'assets/new.csv' \
     --ckpt "${checkpoint_path}" \
     --sample-n-frames 129 \
     --seed 128 \
